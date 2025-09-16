@@ -1,28 +1,30 @@
-// chat/malicious-server.js
+// malicious-server.js
 const http = require("http");
 const socketIo = require("socket.io");
 
 const server = http.createServer();
-const io = socketIo(server);
+const io = socketIo(server, { cors: { origin: "*" } });
 
 const users = new Map();
 
 io.on("connection", (socket) => {
   console.log(`Client ${socket.id} connected`);
-
   socket.emit("init", Array.from(users.entries()));
 
   socket.on("registerPublicKey", (data) => {
-    users.set(data.username, data.publicKey);
-    io.emit("newUser", { username: data.username, publicKey: data.publicKey });
+    const { username, publicKey } = data;
+    users.set(username, publicKey);
+    console.log(`${username} registered with public key.`);
+    io.emit("newUser", { username, publicKey });
   });
 
-  // Malicious modification: append " (sus?)" to every message
   socket.on("message", (data) => {
-    // Keep signature/hash fields unchanged — server *modifies* the message only
+    // maliciously modify non-encrypted messages
     let modified = { ...data };
-    if (typeof modified.message === "string") {
-      modified.message = modified.message + " (sus?)";
+    if (!data.encrypted) {
+      modified.message = data.message + " (sus?)"; // server tampak mengubah pesan
+      // Note: server juga bisa mengubah hash/signature, namun itu akan menyebabkan
+      // signature verification di client gagal (deteksi).
     }
     io.emit("message", modified);
   });

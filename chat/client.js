@@ -1,6 +1,8 @@
-// chat/client.js
+// client.js
 const io = require("socket.io-client");
 const readline = require("readline");
+const fs = require("fs");
+const path = require("path");
 const crypto = require("crypto");
 
 const socket = io("http://localhost:3000");
@@ -11,59 +13,77 @@ const rl = readline.createInterface({
   prompt: "> ",
 });
 
-let username = "";
 let registeredUsername = "";
-let targetUsername = "";
-const users = new Map(); // username -> publicKey
+let username = "";
+const users = new Map(); // username -> publicKey (pem)
+let targetUsername = ""; // untuk !secret command
 
-// Generate RSA keypair for this client (public key is registered with server)
-function generateRSAKeys() {
-  const { publicKey, privateKey } = crypto.generateKeyPairSync("rsa", {
-    modulusLength: 2048,
-    publicKeyEncoding: { type: "spki", format: "pem" },
-    privateKeyEncoding: { type: "pkcs8", format: "pem" },
-  });
-  return { publicKey, privateKey };
+let privateKey = null;
+let publicKey = null;
+
+function ensureKeysDir() {
+  const dir = path.join(__dirname, "keys");
+  if (!fs.existsSync(dir)) fs.mkdirSync(dir);
+  return dir;
 }
 
-const { publicKey, privateKey } = generateRSAKeys();
+function loadOrCreateKeys(username) {
+  const dir = ensureKeysDir();
+  const privPath = path.join(dir, `${username}_private.pem`);
+  const pubPath = path.join(dir, `${username}_public.pem`);
 
-function signMessage(message) {
-  const sign = crypto.createSign("sha256");
-  sign.update(message);
-  sign.end();
-  return sign.sign(privateKey, "hex");
+  if (fs.existsSync(privPath) && fs.existsSync(pubPath)) {
+    privateKey = fs.readFileSync(privPath, "utf8");
+    publicKey = fs.readFileSync(pubPath, "utf8");
+    console.log("Loaded existing key pair from keys/");
+  } else {
+    const { publicKey: pub, privateKey: priv } = crypto.generateKeyPairSync("rsa", {
+      modulusLength: 2048,
+      publicKeyEncoding: { type: "spki", format: "pem" },
+      privateKeyEncoding: { type: "pkcs8", format: "pem" },
+    });
+    fs.writeFileSync(privPath, priv);
+    fs.writeFileSync(pubPath, pub);
+    privateKey = priv;
+    publicKey = pub;
+    console.log("Generated new RSA key pair and saved to keys/");
+  }
 }
 
-function verifyMessage(message, signature, senderPublicKey) {
-  if (!senderPublicKey) return false;
+function sign(data) {
+  return crypto.createSign("sha256").update(data).end().sign(privateKey, "base64");
+}
+function verify(data, signature, senderPubKey) {
   try {
-    const verify = crypto.createVerify("sha256");
-    verify.update(message);
-    verify.end();
-    return verify.verify(senderPublicKey, signature, "hex");
-  } catch (err) {
+    return crypto.createVerify("sha256").update(data).end().verify(senderPubKey, signature, "base64");
+  } catch (e) {
     return false;
   }
 }
-
-function generateHash(content) {
-  return crypto.createHash("sha256").update(content).digest("hex");
+function hashOf(data) {
+  return crypto.createHash("sha256").update(data).digest("hex");
 }
 
-function encryptForRecipient(message, recipientPublicKey) {
-  const buf = Buffer.from(message, "utf8");
-  // NOTE: messages must be short enough for RSA; for long messages use hybrid encryption
-  return crypto.publicEncrypt(recipientPublicKey, buf).toString("hex");
+function sendMessagePlain(message) {
+  const sig = sign(message);
+  const h = hashOf(message);
+  socket.emit("message", { username, message, signature: sig, hash: h, encrypted: false, target: "" });
+  console.log(`You: ${message}`);
 }
 
-function decryptWithPrivateKey(ciphertextHex) {
-  try {
-    const buf = Buffer.from(ciphertextHex, "hex");
-    return crypto.privateDecrypt(privateKey, buf).toString("utf8");
-  } catch (err) {
-    return null;
+function sendMessageSecret(message, target) {
+  const recipientPub = users.get(target);
+  if (!recipientPub) {
+    console.log(`Tidak ada public key untuk ${target}. Pastikan user sudah join dan register public key.`);
+    return;
   }
+  // Encrypt with recipient's public key (RSA)
+  const encryptedBuf = crypto.publicEncrypt(recipientPub, Buffer.from(message));
+  const encryptedBase64 = encryptedBuf.toString("base64");
+  const sig = sign(encryptedBase64); // sign the ciphertext
+  const h = hashOf(encryptedBase64);
+  socket.emit("message", { username, message: encryptedBase64, signature: sig, hash: h, encrypted: true, target });
+  console.log(`(to ${target} encrypted) You: ${message}`);
 }
 
 socket.on("connect", () => {
@@ -72,9 +92,15 @@ socket.on("connect", () => {
   rl.question("Enter your username: ", (input) => {
     username = input.trim();
     registeredUsername = username;
-    console.log(`Welcome, ${username} to the chat`);
+    if (!username) {
+      console.log("Username tidak boleh kosong. Keluar.");
+      process.exit(1);
+    }
 
-    // Register public key with the server
+    // load or create RSA keys per username
+    loadOrCreateKeys(username);
+
+    // register public key at server
     socket.emit("registerPublicKey", { username, publicKey });
 
     rl.prompt();
@@ -83,48 +109,19 @@ socket.on("connect", () => {
       const message = line.trim();
       if (!message) { rl.prompt(); return; }
 
-      // Commands:
-      // !secret <username> -> set target for secret messages
-      // !exit -> stop secret mode
-      if ((match = message.match(/^!secret (\w+)$/))) {
+      let match;
+      if ((match = message.match(/^!secret\s+(\w+)$/))) {
         targetUsername = match[1];
         console.log(`Now secretly chatting with ${targetUsername}`);
-        rl.prompt();
-        return;
-      } else if (message === "!exit") {
+      } else if (message.match(/^!exit$/)) {
         console.log(`No more secretly chatting with ${targetUsername}`);
         targetUsername = "";
-        rl.prompt();
-        return;
-      }
-
-      // Normal send or secret send
-      if (targetUsername && users.has(targetUsername)) {
-        // SECRET send
-        const recipientKey = users.get(targetUsername);
-        // We sign the plaintext (for authenticity), then encrypt the plaintext for recipient
-        const signature = signMessage(message);
-        const ciphertextHex = encryptForRecipient(message, recipientKey);
-        const hash = generateHash(ciphertextHex); // hash over ciphertext to detect tampering
-        socket.emit("message", {
-          username,
-          message: ciphertextHex,
-          signature,
-          hash,
-          secret: true,
-          to: targetUsername,
-        });
       } else {
-        // Plain broadcast
-        const signature = signMessage(message);
-        const hash = generateHash(message); // hash over plaintext for tamper detection
-        socket.emit("message", {
-          username,
-          message,
-          signature,
-          hash,
-          secret: false,
-        });
+        if (targetUsername) {
+          sendMessageSecret(message, targetUsername);
+        } else {
+          sendMessagePlain(message);
+        }
       }
 
       rl.prompt();
@@ -132,77 +129,68 @@ socket.on("connect", () => {
   });
 });
 
-// Receive list of users/public keys on connect
-socket.on("init", (entries) => {
-  entries.forEach(([user, key]) => users.set(user, key));
+socket.on("init", (keysArray) => {
+  // keysArray: [ [username, publicKey], ... ]
+  keysArray.forEach(([u, key]) => users.set(u, key));
   console.log(`\nThere are currently ${users.size} users in the chat`);
   rl.prompt();
 });
 
 socket.on("newUser", (data) => {
-  const { username: newUser, publicKey: pk } = data;
-  users.set(newUser, pk);
-  console.log(`${newUser} joined the chat`);
+  const { username: newU, publicKey: pk } = data;
+  users.set(newU, pk);
+  console.log(`${newU} joined the chat`);
   rl.prompt();
 });
 
-// Handle incoming messages
 socket.on("message", (data) => {
-  const {
-    username: senderUsername,
-    message: senderMessage,
-    signature,
-    hash,
-    secret,
-    to,
-  } = data;
+  const { username: senderUsername, message: senderMessage, signature, hash, encrypted, target } = data;
 
-  // If secret message:
-  if (secret) {
-    // If we are the recipient -> try decrypt
-    if (to === registeredUsername) {
-      const decrypted = decryptWithPrivateKey(senderMessage);
-      if (decrypted === null) {
-        console.log(`🔓 Failed to decrypt secret message from ${senderUsername} (possibly tampered)`);
-      } else {
-        // verify signer (signature over plaintext)
-        const senderPublicKey = users.get(senderUsername);
-        const validSig = verifyMessage(decrypted, signature, senderPublicKey);
-        if (!validSig) {
-          console.log(`⚠️ this user is fake: ${senderUsername} (signature invalid)`);
-        } else {
-          console.log(`🔒 Secret from ${senderUsername}: ${decrypted}`);
-        }
-      }
-    } else {
-      // Not the intended recipient: show ciphertext only (and check ciphertext integrity)
-      const recalcHash = generateHash(senderMessage);
-      if (hash && recalcHash !== hash) {
-        console.log(`⚠️ Encrypted message for ${to} may have been changed during transmission`);
-      } else {
-        console.log(`(Encrypted message for ${to} from ${senderUsername}): ${senderMessage}`);
-      }
+  // avoid printing our own echo
+  if (senderUsername === username) return;
+
+  if (!encrypted) {
+    // plain message: check hash and signature
+    const computedHash = hashOf(senderMessage);
+    if (hash && computedHash !== hash) {
+      console.log(`*** WARNING: Hash mismatch for message from ${senderUsername} — pesan mungkin diubah selama transmisi`);
     }
+
+    const senderPub = users.get(senderUsername);
+    if (!senderPub) {
+      console.log(`${senderUsername}: ${senderMessage} (tidak ada public key untuk verifikasi)`);
+      return;
+    }
+    const ok = verify(senderMessage, signature, senderPub);
+    if (!ok) {
+      console.log(`*** WARNING: Signature verification FAILED for ${senderUsername} — kemungkinan impersonation`);
+    }
+    console.log(`${senderUsername}: ${senderMessage}`);
   } else {
-    // Not secret: verify hash and signature
-    const recalcHash = generateHash(senderMessage);
-    if (hash && recalcHash !== hash) {
-      console.log(`⚠️ WARNING: Message from ${senderUsername} may have been changed during transmission`);
-      // We can still try verify signature on received (tampered) message, but it will likely fail
-    }
-
-    const senderPublicKey = users.get(senderUsername);
-    const valid = verifyMessage(senderMessage, signature, senderPublicKey);
-    if (!valid) {
-      console.log(`⚠️ this user is fake: ${senderUsername} (signature invalid)`);
-    } else {
-      if (senderUsername !== registeredUsername) {
-        console.log(`${senderUsername}: ${senderMessage}`);
+    // encrypted message
+    if (target === registeredUsername) {
+      // pesan terenkripsi untuk kita -> coba decrypt
+      try {
+        const decrypted = crypto.privateDecrypt(privateKey, Buffer.from(senderMessage, "base64")).toString();
+        const senderPub = users.get(senderUsername);
+        if (senderPub) {
+          const ok = verify(senderMessage, signature, senderPub); // verify signature over ciphertext
+          if (!ok) {
+            console.log(`*** WARNING: Signature verification FAILED for ${senderUsername} (encrypted message) — kemungkinan impersonation`);
+          }
+        } else {
+          console.log(`(Encrypted from ${senderUsername}) Decrypted: ${decrypted} (no pubkey to verify)`);
+          return;
+        }
+        console.log(`${senderUsername} (secret): ${decrypted}`);
+      } catch (e) {
+        console.log(`*** Received encrypted message for you from ${senderUsername}, tetapi gagal didekripsi.`);
       }
+    } else {
+      // bukan untuk kita -> tampilkan gibberish notice
+      console.log(`${senderUsername} -> ${target}: <encrypted message (not for you)>`);
     }
   }
-
-  rl.prompt();
 });
 
 socket.on("disconnect", () => {

@@ -1,16 +1,15 @@
-// chat/server.js
+// server.js
 const http = require("http");
 const socketIo = require("socket.io");
 
 const server = http.createServer();
-const io = socketIo(server);
+const io = socketIo(server, { cors: { origin: "*" } });
 
-const users = new Map(); // username -> publicKey
+const users = new Map(); // username -> publicKey (pem string)
 
 io.on("connection", (socket) => {
   console.log(`Client ${socket.id} connected`);
 
-  // Send existing user -> publicKey list to new client
   socket.emit("init", Array.from(users.entries()));
 
   socket.on("registerPublicKey", (data) => {
@@ -20,8 +19,8 @@ io.on("connection", (socket) => {
     io.emit("newUser", { username, publicKey });
   });
 
-  // Broadcast message as-is
   socket.on("message", (data) => {
+    // data: { username, message, signature, hash, encrypted, target }
     io.emit("message", data);
   });
 
